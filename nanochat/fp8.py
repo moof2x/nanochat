@@ -101,14 +101,14 @@ class _Float8Matmul(torch.autograd.Function):
         grad_input = torch._scaled_mm(
             go_fp8, w_col,
             scale_a=go_inv, scale_b=w_inv,
-            out_dtype=grad_output.dtype, use_fast_accum=True,
+            out_dtype=grad_output.dtype, use_fast_accum=False,
         )
 
         # grad_weight = grad_output.T @ input
         grad_weight = torch._scaled_mm(
             go_t, in_col,
             scale_a=go_inv, scale_b=in_inv,
-            out_dtype=grad_output.dtype, use_fast_accum=True,
+            out_dtype=grad_output.dtype, use_fast_accum=False,
         )
 
         return grad_input, grad_weight
