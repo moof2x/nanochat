@@ -67,13 +67,6 @@ compared to the matmul. In practice this means our version is slightly faster
 (less compilation overhead, no tensor subclass dispatch cost) but can produce
 subtly different floating-point rounding paths under torch.compile, since Inductor
 generates a different graph. Numerics are bitwise identical in eager mode.
-
-V3 evolution changes
-====================
-  1. _to_fp8: compute abs() in native dtype (bf16), upcast only the scalar amax
-     to fp32. Scale division in fp32 (not fp64). Multiply still in fp32.
-  2. _Float8Matmul: pre-compute column-major layouts in forward, save for backward.
-     Avoids redundant _to_col_major calls during backward.
 """
 
 import torch
@@ -96,14 +89,18 @@ def _to_fp8(x, fp8_dtype):
     Returns (fp8_data, inverse_scale) for use with torch._scaled_mm.
     """
     fp8_max = torch.finfo(fp8_dtype).max
-    # Compute amax in native dtype (bf16) for speed, upcast only the scalar
-    amax = x.abs().max().float()
-    # Scale in fp32 (not fp64 as in original — trades ~1 ULP precision for speed)
-    scale = (fp8_max / amax.clamp(min=EPS)).float()
-    # Quantize: upcast to fp32 for the multiply to preserve precision,
-    # saturate, then cast to FP8
-    x_scaled = (x.float() * scale).clamp(-fp8_max, fp8_max)
-    x_fp8 = x_scaled.to(fp8_dtype)
+    # Compute the max absolute value across the entire tensor
+    amax = x.float().abs().max()
+    # Scale maps [0, amax] -> [0, fp8_max]. Use float64 for the division to
+    # ensure consistent numerics between torch.compile and eager mode.
+    # (torchao does the same upcast — without it, compile/eager can diverge)
+    scale = fp8_max / amax.double().clamp(min=EPS)
+    scale = scale.float()
+    # Quantize: scale into FP8 range, saturate (clamp prevents overflow when
+    # casting — PyTorch's default is to wrap, not saturate), then cast to FP8
+    x_scaled = x.float() * scale
+    x_clamped = x_scaled.clamp(-fp8_max, fp8_max)
+    x_fp8 = x_clamped.to(fp8_dtype)
     # _scaled_mm expects the *inverse* of our scale (it multiplies by this to
     # convert FP8 values back to the original range during the matmul)
     inv_scale = scale.reciprocal()
@@ -137,12 +134,7 @@ class _Float8Matmul(torch.autograd.Function):
         # Quantize both operands to e4m3 (higher precision format)
         input_fp8, input_inv = _to_fp8(input_2d, torch.float8_e4m3fn)
         weight_fp8, weight_inv = _to_fp8(weight, torch.float8_e4m3fn)
-
-        # Pre-compute column-major layouts for backward to avoid
-        # redundant _to_col_major calls during the backward pass
-        w_col = _to_col_major(weight_fp8)
-        in_col = _to_col_major(input_fp8)
-        ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv, w_col, in_col)
+        ctx.save_for_backward(input_fp8, input_inv, weight_fp8, weight_inv)
 
         # output = input @ weight.T
         # input_fp8 is [B, K] contiguous = row-major (good for first arg)
@@ -163,14 +155,15 @@ class _Float8Matmul(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
-        in_fp8, in_inv, w_fp8, w_inv, w_col, in_col = ctx.saved_tensors
+        in_fp8, in_inv, w_fp8, w_inv = ctx.saved_tensors
 
         # === GEMM 1: grad_input = grad_output @ weight ===
         # Shapes: [B, N] @ [N, K] -> [B, K]
         # Gradients use e5m2 (wider range), weights use e4m3 (higher precision)
         go_fp8, go_inv = _to_fp8(grad_output, torch.float8_e5m2)
         # go_fp8 is [B, N] contiguous = row-major, good for first arg
-        # w_col is already in column-major layout (pre-computed in forward)
+        # w_fp8 is [N, K] contiguous = row-major, need column-major for second arg
+        w_col = _to_col_major(w_fp8)
         grad_input = torch._scaled_mm(
             go_fp8,
             w_col,
@@ -186,7 +179,7 @@ class _Float8Matmul(torch.autograd.Function):
         # Transposing gives column-major, but first arg needs row-major,
         # so we must call .contiguous() to physically rearrange the memory.
         go_T = go_fp8.t().contiguous()  # [N, B] row-major
-        # in_col is already in column-major layout (pre-computed in forward)
+        in_col = _to_col_major(in_fp8)    # [B, K] column-major
         grad_weight = torch._scaled_mm(
             go_T,
             in_col,
