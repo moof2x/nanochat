@@ -25,6 +25,13 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
+# Fused Triton kernels (Hopper TMA): relu(x @ W1.T)^2 fused inside matmul tile
+try:
+    from nanochat.fused_kernels import fused_mlp as _fused_mlp
+    HAS_FUSED_MLP = True
+except ImportError:
+    HAS_FUSED_MLP = False
+
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -131,8 +138,19 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
+        # Cache the transposed projection weight for the fused kernel (avoids per-forward copy)
+        self._c_proj_T: torch.Tensor | None = None
 
     def forward(self, x):
+        if HAS_FUSED_MLP and x.is_cuda and self.training:
+            # Fused Triton path: relu(x @ W1.T)^2 @ W2 in fewer memory round-trips.
+            # The kernel expects W2 with shape (hdim, D) so that post @ W2 = (B*T, hdim) @ (hdim, D).
+            # c_proj.weight is (D, hdim), so we pass its transpose.
+            # We cache the contiguous transpose to avoid recomputing it every forward.
+            if self._c_proj_T is None or self._c_proj_T.data_ptr() != self.c_proj.weight.data_ptr():
+                self._c_proj_T = self.c_proj.weight.T.contiguous()
+            return _fused_mlp(x, self.c_fc.weight.to(x.dtype), self._c_proj_T.to(x.dtype))
+        # Standard path (inference, CPU/MPS, or triton unavailable)
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
