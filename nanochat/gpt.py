@@ -463,20 +463,16 @@ class GPT(nn.Module):
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
+        logits = logits.float() # switch to fp32 for logit softcap and loss computation
+        logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
         if targets is not None:
-            # Training: compute softcap + cross-entropy without materializing fp32 logits.
-            # F.cross_entropy internally upcasts to fp32 for log-softmax, so explicit
-            # .float() is redundant and wastes HBM bandwidth on the huge logits tensor.
-            # Keeping softcap in bf16 is fine — tanh is smooth and bf16 has enough range
-            # for the [-15, 15] output. (Inspired by modded-nanogpt Record 37, @Gusarich)
-            logits = softcap * torch.tanh(logits / softcap)
+            # training: given the targets, compute and return the loss
+            # TODO experiment with chunked cross-entropy?
             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
             return loss
         else:
-            # Inference: use fp32 for precise sampling (softcap + temperature scaling)
-            logits = logits.float()
-            logits = softcap * torch.tanh(logits / softcap)
+            # inference: just return the logits directly
             return logits
 
     @torch.inference_mode()
