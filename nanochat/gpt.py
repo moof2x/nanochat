@@ -25,10 +25,6 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
-# Fused lm_head + softcap + CE is available in nanochat.fused_ce for use at larger
-# model scales where the logit tensor dominates memory. At d12 scale, the standard
-# approach is faster because torch.compile can optimize the full forward graph.
-
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -156,7 +152,7 @@ class Block(nn.Module):
 
 
 class GPT(nn.Module):
-    def __init__(self, config, pad_vocab_size_to=128):
+    def __init__(self, config, pad_vocab_size_to=64):
         """
         NOTE a major footgun: this __init__ function runs in meta device context (!!)
         Therefore, any calculations inside here are shapes and dtypes only, no actual data.
@@ -256,19 +252,13 @@ class GPT(nn.Module):
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
-        # Cast weights to COMPUTE_DTYPE (typically bf16): eliminates the fp32->bf16 cast
-        # that Linear.forward() does on every call. Optimizer states stay fp32, but the
-        # weight parameters themselves are bf16. This matches modded-nanogpt's approach
-        # (CastBf16 record, 2024-11-08) and gives ~1% speedup by eliminating cast overhead.
-        # Exception: fp16 requires fp32 weights because GradScaler cannot unscale fp16 grads.
+        # Cast embeddings to COMPUTE_DTYPE: optimizer can tolerate reduced-precision
+        # embeddings and it saves memory. Exception: fp16 requires fp32 embeddings
+        # because GradScaler cannot unscale fp16 gradients.
         if COMPUTE_DTYPE != torch.float16:
             self.transformer.wte.to(dtype=COMPUTE_DTYPE)
             for ve in self.value_embeds.values():
                 ve.to(dtype=COMPUTE_DTYPE)
-            # Cast all Linear layer weights to COMPUTE_DTYPE
-            for module in self.modules():
-                if isinstance(module, nn.Linear):
-                    module.weight.data = module.weight.data.to(COMPUTE_DTYPE)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=100000, device=None):
         # TODO: bump base theta more? e.g. 100K is more common more recently
