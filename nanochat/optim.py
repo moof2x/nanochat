@@ -5,6 +5,25 @@ Two versions are provided (MuonAdamW, DistMuonAdamW), for single GPU and distrib
 
 Addapted from: https://github.com/KellerJordan/modded-nanogpt
 Further contributions from @karpathy and @chrisjmccormick.
+
+This file also contains an Aurora variant. Aurora ("A Leverage-Aware Optimizer for
+Rectangular Matrices", Tilde Research, 2026; https://blog.tilderesearch.com/blog/aurora,
+reference impl: https://github.com/tilde-research/aurora-release) replaces Muon's
+plain polar factor with a damped iteration that alternates polar(.) and a row-norm
+rebalancing step on tall (or transposed-tall) matrices, so that the orthogonalized
+update sits on the joint Stiefel + row-oblique manifold. For square matrices Aurora
+reduces to Muon. The key behavioural difference vs Muon+NorMuon is that Aurora
+preserves polar precision while still producing row-uniform updates, which the
+Aurora authors attribute to fewer "dead" MLP neurons.
+
+In nanochat's optimizer the existing Muon path already includes:
+    - Polar Express orthogonalization
+    - NorMuon-style per-row variance reduction
+    - Cautious-update masking
+The Aurora kind below replaces the polar+variance-reduction pair with Aurora's
+leverage-uniform polar (using the same Polar Express coefficients as the inner
+orthogonalizer, for a fair head-to-head with the Muon path), and keeps the
+cautious update + decoupled weight decay unchanged.
 """
 
 import torch
@@ -88,6 +107,34 @@ polar_express_coeffs = [
     (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
 ]
 
+# Canonical Polar Express coefficients from Amsel et al. 2025 (Algorithm 1 in
+# https://arxiv.org/pdf/2505.16932, also at https://github.com/NoahAmsel/PolarExpress).
+# These are the "as-published" coefficients with the standard 1.01 safety
+# factor applied to all but the last iterate. Extending PE beyond 5 steps was
+# the bottleneck for testing PE-8 in nanochat; the canonical table is needed
+# because the safety_factor=2e-2/cushion=2 polynomials above were only fit
+# for num_iters=5. We use this list when the caller asks for ns_steps > 5,
+# or when --ns-coeffs=canonical is set.
+#
+# Note: the asymptotic coefficient is (1.875, -1.25, 0.375) — i.e. the
+# degree-5 polynomial p(x) = 15x/8 - 10x^3/8 + 3x^5/8 with x rescaled, which
+# has a super-attracting fixed point at x=1.
+_polar_express_canonical_raw = [
+    (8.28721201814563,  -23.595886519098837, 17.300387312530933),
+    (4.107059111542203, -2.9478499167379106, 0.5448431082926601),
+    (3.9486908534822946,-2.908902115962949,  0.5518191394370137),
+    (3.3184196573706015,-2.488488024314874,  0.51004894012372  ),
+    (2.300652019954817, -1.6689039845747493, 0.4188073119525673),
+    (1.891301407787398, -1.2679958271945868, 0.37680408948524835),
+    (1.8750014808534479,-1.2500016453999487, 0.3750001645474248),
+    (1.875,             -1.25,                0.375              ),
+]
+_safety = 1.01
+polar_express_coeffs_canonical = [
+    (a / _safety, b / _safety**3, c / _safety**5)
+    for (a, b, c) in _polar_express_canonical_raw[:-1]
+] + [_polar_express_canonical_raw[-1]]
+
 @torch.compile(dynamic=False, fullgraph=True)
 def muon_step_fused(
     stacked_grads: Tensor,          # (12, 768, 3072) - stacked gradients
@@ -148,6 +195,217 @@ def muon_step_fused(
     stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
 
 # -----------------------------------------------------------------------------
+# Variant of muon_step_fused that reads coefficients from
+# polar_express_coeffs_canonical (the as-published Polar Express table from
+# Amsel et al. 2025). Lets us run with up to 8 PE steps, or sweep ns_steps
+# on the canonical schedule. Behaviour identical to muon_step_fused otherwise.
+@torch.compile(dynamic=False, fullgraph=True)
+def muon_step_fused_canonical(
+    stacked_grads: Tensor, stacked_params: Tensor,
+    momentum_buffer: Tensor, second_momentum_buffer: Tensor,
+    momentum_t: Tensor, lr_t: Tensor, wd_t: Tensor, beta2_t: Tensor,
+    ns_steps: int, red_dim: int,
+) -> None:
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+    if g.size(-2) > g.size(-1):
+        for a, b, c in polar_express_coeffs_canonical[:ns_steps]:
+            A = X.mT @ X
+            B = b * A + c * (A @ A)
+            X = a * X + X @ B
+    else:
+        for a, b, c in polar_express_coeffs_canonical[:ns_steps]:
+            A = X @ X.mT
+            B = b * A + c * (A @ A)
+            X = a * X + B @ X
+    g = X
+    beta2 = beta2_t.to(g.dtype)
+    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
+    red_dim_size = g.size(red_dim)
+    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
+    v_norm = v_norm_sq.sqrt()
+    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
+    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
+    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
+    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
+    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
+    g = g * final_scale.to(g.dtype)
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+# -----------------------------------------------------------------------------
+"""
+Aurora step: Muon update with a leverage-uniform polar factor.
+
+Reference: https://blog.tilderesearch.com/blog/aurora
+            https://github.com/tilde-research/aurora-release
+
+For a (tall) update X = G/||G||_F, define D_0 = I and iterate
+    r_k       = row-norms of X_k
+    D_k       = D_{k-1}^beta * diag(r_k)^(1-beta)
+    X_{k+1}   = polar( sqrt(n/m) * D_k^{-1} X_k )
+which alternately enforces row-norm uniformity and orthogonality. The final
+iterate is on the Stiefel manifold; the diagonal preconditioner D suppresses
+rows with large leverage. For wide matrices we transpose to tall first; for
+square matrices we fall through to a single polar factor (Aurora == Muon).
+
+We absorb the diagonal D into X explicitly (X <- D^{-1} X) so the inner loop
+only touches the matmul-heavy part. The Aurora authors call this the "vanilla"
+(non-Riemannian) Aurora: a damped fixed-point projection.
+
+The variance-reduction step from NorMuon is omitted in this path: by Claim 1
+of the Aurora paper, NorMuon's row normalization is in tension with the polar
+constraint, and Aurora is designed to make that step unnecessary. We do keep
+nanochat's cautious-update masking + decoupled weight decay (orthogonal to the
+Aurora algorithmic novelty).
+"""
+
+# Same Polar Express coefficients used by Muon path: keeps the inner
+# orthogonalizer comparable head-to-head with the existing Muon path.
+@torch.compile(dynamic=False, fullgraph=True)
+def aurora_step_fused(
+    stacked_grads: Tensor,           # (K, m, n) - stacked gradients
+    stacked_params: Tensor,          # (K, m, n) - stacked parameters
+    momentum_buffer: Tensor,         # (K, m, n) - first moment buffer
+    momentum_t: Tensor,              # () - 0-D CPU tensor, momentum coefficient
+    lr_t: Tensor,                    # () - 0-D CPU tensor, learning rate
+    wd_t: Tensor,                    # () - 0-D CPU tensor, weight decay
+    ns_steps: int,                   # number of polar Newton-Schulz iterations
+    pp_iterations: int,              # number of Aurora outer (row-rebalance) iterations
+    pp_beta: float,                  # damping exponent for D update, in (0, 1]
+    eps: float,                      # numerical floor for row norms
+    do_aurora: bool,                 # True => tall(/wide-transposed); False => square (skip rebalance)
+) -> None:
+    """
+    Fused Aurora step: nesterov_momentum -> aurora_polar -> cautious_update.
+    All shape-static so torch.compile fully traces it.
+
+    Signature mirrors muon_step_fused for shape compatibility with the
+    DistMuonAdamW comm layout. red_dim and second_momentum_buffer are
+    deliberately absent: Aurora replaces NorMuon's variance reduction.
+    """
+    # Nesterov momentum (identical to Muon path).
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+
+    # Cast to bf16 (matching Muon path) for tensor-core friendly matmuls in polar.
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+
+    m_dim = X.size(-2)
+    n_dim = X.size(-1)
+    transposed = m_dim < n_dim
+    if transposed:
+        # Make the "long" dimension the row axis so the leverage-anisotropy
+        # statement (rows out-number columns) holds; transpose back at the end.
+        X = X.mT
+
+    # After (possible) transpose we have X of shape (..., M, N) with M >= N.
+    M = X.size(-2)
+    N = X.size(-1)
+    target_row_sq = float(N) / float(M)  # uniform leverage value n/m
+
+    if do_aurora:
+        # Aurora damped iteration. We track D implicitly by folding it into X.
+        for k in range(pp_iterations):
+            # Polar(X) using the same Polar Express coefficients as Muon path.
+            # Re-normalise spectral norm at the start of *every* inner polar so
+            # the Newton-Schulz iteration stays in its convergence basin even
+            # after the row-rescaling step (which can change the spectrum).
+            P = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+            # Inner Polar Express loop (ns_steps coefficients), tall branch.
+            for a, b, c in polar_express_coeffs[:ns_steps]:
+                A = P.mT @ P
+                B = b * A + c * (A @ A)
+                P = a * P + P @ B
+            if k < pp_iterations - 1:
+                # Update X = D^{-1} P with D from row norms of P, so the next
+                # polar call sees a row-mass-balanced matrix. We rescale to
+                # match the target row-squared-norm n/m, raised to the damping
+                # exponent pp_beta to suppress oscillations between iterates.
+                row_sq = P.float().pow(2).sum(dim=-1, keepdim=True).clamp_min(eps * eps)
+                scale = (target_row_sq / row_sq).pow(pp_beta * 0.5).to(P.dtype)
+                X = P * scale
+            else:
+                X = P
+    else:
+        # Square: vanilla polar (Aurora collapses to Muon here).
+        P = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+        for a, b, c in polar_express_coeffs[:ns_steps]:
+            A = P.mT @ P
+            B = b * A + c * (A @ A)
+            P = a * P + P @ B
+        X = P
+
+    if transposed:
+        X = X.mT
+    g = X
+
+    # Spectral aspect-ratio scaling: this is folded into lr_t by the caller
+    # (see _step_aurora). Cautious weight decay + parameter update.
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+# -----------------------------------------------------------------------------
+# Variant of aurora_step_fused that uses the canonical Polar Express
+# coefficient table (Amsel et al. 2025) for the inner orthogonalizer. Lets us
+# run Aurora with up to 8 PE steps for a higher-precision polar.
+@torch.compile(dynamic=False, fullgraph=True)
+def aurora_step_fused_canonical(
+    stacked_grads: Tensor, stacked_params: Tensor, momentum_buffer: Tensor,
+    momentum_t: Tensor, lr_t: Tensor, wd_t: Tensor,
+    ns_steps: int, pp_iterations: int, pp_beta: float, eps: float, do_aurora: bool,
+) -> None:
+    momentum = momentum_t.to(stacked_grads.dtype)
+    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
+    g = stacked_grads.lerp_(momentum_buffer, momentum)
+    X = g.bfloat16() if COMPUTE_DTYPE == torch.bfloat16 else g
+    m_dim = X.size(-2)
+    n_dim = X.size(-1)
+    transposed = m_dim < n_dim
+    if transposed:
+        X = X.mT
+    M = X.size(-2)
+    N = X.size(-1)
+    target_row_sq = float(N) / float(M)
+    if do_aurora:
+        for k in range(pp_iterations):
+            P = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+            for a, b, c in polar_express_coeffs_canonical[:ns_steps]:
+                A = P.mT @ P
+                B = b * A + c * (A @ A)
+                P = a * P + P @ B
+            if k < pp_iterations - 1:
+                row_sq = P.float().pow(2).sum(dim=-1, keepdim=True).clamp_min(eps * eps)
+                scale = (target_row_sq / row_sq).pow(pp_beta * 0.5).to(P.dtype)
+                X = P * scale
+            else:
+                X = P
+    else:
+        P = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.01 + 1e-6)
+        for a, b, c in polar_express_coeffs_canonical[:ns_steps]:
+            A = P.mT @ P
+            B = b * A + c * (A @ A)
+            P = a * P + P @ B
+        X = P
+    if transposed:
+        X = X.mT
+    g = X
+    lr = lr_t.to(g.dtype)
+    wd = wd_t.to(g.dtype)
+    mask = (g * stacked_params) >= 0
+    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+
+
+# -----------------------------------------------------------------------------
 # Single GPU version of the MuonAdamW optimizer.
 # Used mostly for reference, debugging and testing.
 
@@ -192,6 +450,10 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        # Aurora tensors (separate to avoid recompilation collisions with Muon path).
+        self._aurora_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._aurora_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._aurora_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _step_adamw(self, group: dict) -> None:
         """
@@ -265,8 +527,13 @@ class MuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
         self._muon_wd_t.fill_(group["weight_decay"])
 
-        # Single fused kernel: momentum -> polar_express -> variance_reduction -> update
-        muon_step_fused(
+        # Dispatch to the right fused kernel based on which Polar Express
+        # coefficient table the caller asked for. Default ('nanochat') keeps
+        # the historical 5-step coefficients. 'canonical' uses the Amsel et al.
+        # 2025 table (supports up to 8 PE steps).
+        coeffs = group.get("coeffs", "nanochat")
+        kernel = muon_step_fused if coeffs == "nanochat" else muon_step_fused_canonical
+        kernel(
             stacked_grads,
             stacked_params,
             momentum_buffer,
@@ -282,6 +549,57 @@ class MuonAdamW(torch.optim.Optimizer):
         # Copy back to original params
         torch._foreach_copy_(params, list(stacked_params.unbind(0)))
 
+    def _step_aurora(self, group: dict) -> None:
+        """
+        Aurora update for all params in the group (stacked for efficiency).
+        Same buffer-stacking strategy as _step_muon. No second-moment buffer:
+        Aurora replaces NorMuon's variance reduction with the row-rebalancing
+        polar iteration.
+        """
+        params: list[Tensor] = group['params']
+        if not params:
+            return
+
+        p = params[0]
+        state = self.state[p]
+        num_params = len(params)
+        shape, device, dtype = p.shape, p.device, p.dtype
+
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
+        momentum_buffer = state["momentum_buffer"]
+
+        stacked_grads = torch.stack([p.grad for p in params])
+        stacked_params = torch.stack(params)
+
+        self._aurora_momentum_t.fill_(group["momentum"])
+        # Match Muon's spectral aspect-ratio scaling on the LR (Muon convention).
+        self._aurora_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+        self._aurora_wd_t.fill_(group["weight_decay"])
+
+        # Aurora is meaningful only on rectangular matrices (M != N). For square
+        # matrices the row-norm rebalancing has no degrees of freedom (claim 1
+        # in the Aurora paper) and Aurora reduces to Muon's polar update.
+        do_aurora = (shape[-2] != shape[-1])
+
+        coeffs = group.get("coeffs", "nanochat")
+        kernel = aurora_step_fused if coeffs == "nanochat" else aurora_step_fused_canonical
+        kernel(
+            stacked_grads,
+            stacked_params,
+            momentum_buffer,
+            self._aurora_momentum_t,
+            self._aurora_lr_t,
+            self._aurora_wd_t,
+            group["ns_steps"],
+            group["pp_iterations"],
+            float(group["pp_beta"]),
+            float(group.get("aurora_eps", 1e-7)),
+            bool(do_aurora),
+        )
+
+        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
+
     @torch.no_grad()
     def step(self):
         for group in self.param_groups:
@@ -289,6 +607,8 @@ class MuonAdamW(torch.optim.Optimizer):
                 self._step_adamw(group)
             elif group['kind'] == 'muon':
                 self._step_muon(group)
+            elif group['kind'] == 'aurora':
+                self._step_aurora(group)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -367,6 +687,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
         self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
         self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._aurora_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._aurora_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
+        self._aurora_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
 
     def _reduce_adamw(self, group: dict, world_size: int) -> dict:
         """Launch async reduce ops for AdamW group. Returns info dict with per-param infos."""
@@ -482,7 +805,9 @@ class DistMuonAdamW(torch.optim.Optimizer):
             self._muon_beta2_t.fill_(group["beta2"])
             self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
             self._muon_wd_t.fill_(group["weight_decay"])
-            muon_step_fused(
+            coeffs = group.get("coeffs", "nanochat")
+            kernel = muon_step_fused if coeffs == "nanochat" else muon_step_fused_canonical
+            kernel(
                 grad_chunk[:num_owned], stacked_owned,
                 state["momentum_buffer"][:num_owned], state["second_momentum_buffer"][:num_owned],
                 self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t, self._muon_beta2_t,
@@ -494,6 +819,78 @@ class DistMuonAdamW(torch.optim.Optimizer):
             updated_params[num_owned:].zero_()
 
         # Reuse stacked_grads buffer for all_gather output
+        stacked_params = info["stacked_grads"]
+        future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
+        gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
+
+    def _reduce_aurora(self, group: dict, world_size: int) -> dict:
+        """Launch async reduce op for an Aurora group. Identical comm pattern
+        to Muon: stack grads, zero-pad to a multiple of world_size, reduce_scatter."""
+        params = group['params']
+        chunk_size = (len(params) + world_size - 1) // world_size
+        padded_num_params = chunk_size * world_size
+        p = params[0]
+        shape, device, dtype = p.shape, p.device, p.dtype
+
+        grad_stack = torch.stack([p.grad for p in params])
+        stacked_grads = torch.empty(padded_num_params, *shape, dtype=dtype, device=device)
+        stacked_grads[:len(params)].copy_(grad_stack)
+        if len(params) < padded_num_params:
+            stacked_grads[len(params):].zero_()
+
+        grad_chunk = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+        future = dist.reduce_scatter_tensor(grad_chunk, stacked_grads, op=dist.ReduceOp.AVG, async_op=True).get_future()
+
+        return dict(future=future, grad_chunk=grad_chunk, stacked_grads=stacked_grads, chunk_size=chunk_size)
+
+    def _compute_aurora(self, group: dict, info: dict, gather_list: list, rank: int) -> None:
+        """Wait for reduce, compute Aurora updates on this rank's chunk, launch all_gather."""
+        info['future'].wait()
+        params = group['params']
+        chunk_size = info['chunk_size']
+        grad_chunk = info['grad_chunk']
+        p = params[0]
+        shape, device, dtype = p.shape, p.device, p.dtype
+
+        start_idx = rank * chunk_size
+        num_owned = min(chunk_size, max(0, len(params) - start_idx))
+
+        state = self.state[p]
+        if "momentum_buffer" not in state:
+            state["momentum_buffer"] = torch.zeros(chunk_size, *shape, dtype=dtype, device=device)
+
+        updated_params = torch.empty(chunk_size, *shape, dtype=dtype, device=device)
+
+        if num_owned > 0:
+            owned_params = [params[start_idx + i] for i in range(num_owned)]
+            stacked_owned = torch.stack(owned_params)
+
+            self._aurora_momentum_t.fill_(group["momentum"])
+            self._aurora_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
+            self._aurora_wd_t.fill_(group["weight_decay"])
+
+            do_aurora = (shape[-2] != shape[-1])
+
+            coeffs = group.get("coeffs", "nanochat")
+            kernel = aurora_step_fused if coeffs == "nanochat" else aurora_step_fused_canonical
+            kernel(
+                grad_chunk[:num_owned],
+                stacked_owned,
+                state["momentum_buffer"][:num_owned],
+                self._aurora_momentum_t,
+                self._aurora_lr_t,
+                self._aurora_wd_t,
+                group["ns_steps"],
+                group["pp_iterations"],
+                float(group["pp_beta"]),
+                float(group.get("aurora_eps", 1e-7)),
+                bool(do_aurora),
+            )
+            updated_params[:num_owned].copy_(stacked_owned)
+
+        if num_owned < chunk_size:
+            updated_params[num_owned:].zero_()
+
         stacked_params = info["stacked_grads"]
         future = dist.all_gather_into_tensor(stacked_params, updated_params, async_op=True).get_future()
         gather_list.append(dict(future=future, stacked_params=stacked_params, params=params))
@@ -518,6 +915,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 reduce_infos.append(self._reduce_adamw(group, world_size))
             elif group['kind'] == 'muon':
                 reduce_infos.append(self._reduce_muon(group, world_size))
+            elif group['kind'] == 'aurora':
+                reduce_infos.append(self._reduce_aurora(group, world_size))
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
@@ -528,6 +927,8 @@ class DistMuonAdamW(torch.optim.Optimizer):
                 self._compute_adamw(group, info, gather_list, rank, world_size)
             elif group['kind'] == 'muon':
                 self._compute_muon(group, info, gather_list, rank)
+            elif group['kind'] == 'aurora':
+                self._compute_aurora(group, info, gather_list, rank)
             else:
                 raise ValueError(f"Unknown optimizer kind: {group['kind']}")
 
