@@ -62,8 +62,24 @@ parser.add_argument("--total-batch-size", type=int, default=-1, help="total batc
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.008, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--weight-decay", type=float, default=0.28, help="cautious weight decay for the Muon optimizer (for weights)")
-parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
+parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon/Aurora)")
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
+# Matrix optimizer choice: Muon (nanochat default; Polar Express + NorMuon-style variance reduction +
+# cautious update) or Aurora (Tilde Research; leverage-uniform damped polar replaces polar + var-reduction).
+parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "aurora"],
+                    help="optimizer for 2D matrix params: 'muon' (default) or 'aurora'")
+parser.add_argument("--aurora-pp-iterations", type=int, default=2,
+                    help="Aurora outer row-rebalance iterations (1 == plain Muon polar; paper default: 2)")
+parser.add_argument("--aurora-pp-beta", type=float, default=0.5,
+                    help="Aurora damping exponent in (0, 1] for row-norm rebalancing (paper default: 0.5)")
+parser.add_argument("--ns-steps", type=int, default=8,
+                    help="Polar Express Newton-Schulz steps for the inner orthogonalizer "
+                         "(applies to both Muon and Aurora paths). Default 5 = nanochat historical. "
+                         "Use 6, 7, 8 with --ns-coeffs=canonical for higher polar precision.")
+parser.add_argument("--ns-coeffs", type=str, default="canonical", choices=["nanochat", "canonical"],
+                    help="Polar Express coefficient table. 'nanochat' = historical 5-step "
+                         "(safety_factor=2e-2, cushion=2). 'canonical' = Amsel et al. 2025 "
+                         "as-published table with 1.01 safety factor (supports up to 8 steps).")
 parser.add_argument("--warmup-steps", type=int, default=40, help="number of steps for LR warmup")
 parser.add_argument("--warmdown-ratio", type=float, default=0.65, help="ratio of iterations for LR warmdown")
 parser.add_argument("--final-lr-frac", type=float, default=0.05, help="final LR as fraction of initial LR")
@@ -310,9 +326,14 @@ optimizer = model.setup_optimizer(
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     embedding_lr=args.embedding_lr * batch_lr_scale,
     scalar_lr=args.scalar_lr * batch_lr_scale,
-    # Muon hyperparameters
+    # Muon/Aurora hyperparameters for matrix params
     matrix_lr=args.matrix_lr * batch_lr_scale,
     weight_decay=weight_decay_scaled,
+    matrix_optimizer=args.matrix_optimizer,
+    aurora_pp_iterations=args.aurora_pp_iterations,
+    aurora_pp_beta=args.aurora_pp_beta,
+    ns_steps=args.ns_steps,
+    ns_coeffs=args.ns_coeffs,
 )
 
 if resuming:
@@ -522,7 +543,9 @@ while True:
     muon_weight_decay = get_weight_decay(step)
     for group in optimizer.param_groups:
         group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
+        # Aurora uses the same momentum / weight-decay schedule as Muon (it is a
+        # drop-in matrix-param optimizer with the same Nesterov-momentum prelude).
+        if group['kind'] in ('muon', 'aurora'):
             group["momentum"] = muon_momentum
             group["weight_decay"] = muon_weight_decay
     if scaler is not None:
