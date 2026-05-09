@@ -25,13 +25,6 @@ from nanochat.optim import MuonAdamW, DistMuonAdamW
 # Our custom Flash Attention module that automatically uses FA3 on Hopper+ and SDPA fallback elsewhere
 from nanochat.flash_attention import flash_attn
 
-# Fused Triton kernels (Hopper TMA): relu(x @ W1.T)^2 fused inside matmul tile
-try:
-    from nanochat.fused_kernels import fused_mlp as _fused_mlp
-    HAS_FUSED_MLP = True
-except ImportError:
-    HAS_FUSED_MLP = False
-
 @dataclass
 class GPTConfig:
     sequence_len: int = 2048
@@ -138,19 +131,8 @@ class MLP(nn.Module):
         super().__init__()
         self.c_fc = Linear(config.n_embd, 4 * config.n_embd, bias=False)
         self.c_proj = Linear(4 * config.n_embd, config.n_embd, bias=False)
-        # Cache the transposed projection weight for the fused kernel (avoids per-forward copy)
-        self._c_proj_T: torch.Tensor | None = None
 
     def forward(self, x):
-        if HAS_FUSED_MLP and x.is_cuda and self.training:
-            # Fused Triton path: relu(x @ W1.T)^2 @ W2 in fewer memory round-trips.
-            # The kernel expects W2 with shape (hdim, D) so that post @ W2 = (B*T, hdim) @ (hdim, D).
-            # c_proj.weight is (D, hdim), so we pass its transpose.
-            # We cache the contiguous transpose to avoid recomputing it every forward.
-            if self._c_proj_T is None or self._c_proj_T.data_ptr() != self.c_proj.weight.data_ptr():
-                self._c_proj_T = self.c_proj.weight.T.contiguous()
-            return _fused_mlp(x, self.c_fc.weight.to(x.dtype), self._c_proj_T.to(x.dtype))
-        # Standard path (inference, CPU/MPS, or triton unavailable)
         x = self.c_fc(x)
         x = F.relu(x).square()
         x = self.c_proj(x)
@@ -255,6 +237,11 @@ class GPT(nn.Module):
         # Decaying x0 init: earlier layers get more input embedding blending
         for i in range(n_layer):
             self.x0_lambdas.data[i] = 0.20 - (0.15 * i / max(n_layer - 1, 1))
+
+        # Smear/backout scalars and smear gate must be explicitly initialized 
+        torch.nn.init.zeros_(self.smear_lambda)
+        torch.nn.init.constant_(self.backout_lambda, 0.2)
+        torch.nn.init.uniform_(self.smear_gate.weight, 0.0, 0.02)
 
         # Value embeddings (init like c_v: uniform with same std)
         for ve in self.value_embeds.values():
@@ -384,7 +371,35 @@ class GPT(nn.Module):
             'total': total,
         }
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02, weight_decay=0.0, scalar_lr=0.5,
+                        matrix_optimizer="muon", aurora_pp_iterations=2, aurora_pp_beta=0.5,
+                        ns_steps=5, ns_coeffs="nanochat"):
+        """
+        matrix_optimizer: 'muon' (default, nanochat baseline: PE + NorMuon-style variance reduction
+                          + cautious update) or 'aurora' (Tilde Research Aurora; replaces the
+                          polar+variance-reduction step with a leverage-uniform damped polar
+                          iteration, keeps cautious update + decoupled WD).
+        aurora_pp_iterations: number of outer Aurora row-rebalance iterations (paper default: 2).
+                              pp_iterations=1 is equivalent to plain Muon polar.
+        aurora_pp_beta: damping exponent in (0, 1] for the row-norm rebalancing step (paper default: 0.5).
+        ns_steps: number of Polar Express Newton-Schulz iterations for the inner orthogonalizer
+                  (default: 5, nanochat historical). Higher = more precise polar = more compute.
+                  With ns_coeffs='canonical', ns_steps up to 8 is supported.
+        ns_coeffs: which Polar Express coefficient table to use:
+                   'nanochat' (default, historical 5-step from nanochat optim.py — fitted with
+                   safety_factor=2e-2/cushion=2; only valid for ns_steps <= 5), or
+                   'canonical' (the as-published Amsel et al. 2025 table with 1.01 safety factor;
+                   valid for ns_steps in [1, 8]).
+        """
+        if ns_coeffs not in ("nanochat", "canonical"):
+            raise ValueError(f"ns_coeffs must be 'nanochat' or 'canonical', got {ns_coeffs!r}")
+        if ns_coeffs == "nanochat" and ns_steps > 5:
+            raise ValueError(
+                f"ns_steps={ns_steps} but ns_coeffs='nanochat' only has 5 entries. "
+                "Use ns_coeffs='canonical' for ns_steps in (5, 8]."
+            )
+        if ns_steps < 1 or ns_steps > 8:
+            raise ValueError(f"ns_steps must be in [1, 8], got {ns_steps}")
         model_dim = self.config.n_embd
         ddp, rank, local_rank, world_size = get_dist_info()
 
@@ -412,13 +427,28 @@ class GPT(nn.Module):
             dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),  # higher beta1 for x0
             dict(kind='adamw', params=smear_params, lr=0.2, betas=(0.8, 0.95), eps=1e-10, weight_decay=0.0),
         ]
-        # Muon groups (matrix params, grouped by shape for stacking)
+        # Matrix-param groups (one group per unique shape so the inner kernel can stack).
+        # `matrix_optimizer` selects which fused kernel (Muon or Aurora) processes them.
+        if matrix_optimizer not in ("muon", "aurora"):
+            raise ValueError(f"matrix_optimizer must be 'muon' or 'aurora', got {matrix_optimizer!r}")
+        print0(f"Matrix-param optimizer: {matrix_optimizer} (ns_steps={ns_steps}, ns_coeffs={ns_coeffs})"
+               + (f" (pp_iterations={aurora_pp_iterations}, pp_beta={aurora_pp_beta})" if matrix_optimizer == "aurora" else ""))
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.9, weight_decay=weight_decay,
-            ))
+            if matrix_optimizer == "muon":
+                param_groups.append(dict(
+                    kind='muon', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=ns_steps, beta2=0.9, weight_decay=weight_decay,
+                    coeffs=ns_coeffs,
+                ))
+            else:  # aurora
+                param_groups.append(dict(
+                    kind='aurora', params=group_params, lr=matrix_lr,
+                    momentum=0.95, ns_steps=ns_steps,
+                    pp_iterations=aurora_pp_iterations, pp_beta=aurora_pp_beta,
+                    weight_decay=weight_decay,
+                    coeffs=ns_coeffs,
+                ))
 
         Factory = DistMuonAdamW if ddp else MuonAdamW
         optimizer = Factory(param_groups)
