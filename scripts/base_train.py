@@ -66,7 +66,7 @@ parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate
 parser.add_argument("--scalar-lr", type=float, default=0.5, help="learning rate for scalars (resid_lambdas, x0_lambdas)")
 # Matrix optimizer choice: Muon (nanochat default; Polar Express + NorMuon-style variance reduction +
 # cautious update) or Aurora (Tilde Research; leverage-uniform damped polar replaces polar + var-reduction).
-parser.add_argument("--matrix-optimizer", type=str, default="muon", choices=["muon", "aurora"],
+parser.add_argument("--matrix-optimizer", type=str, default="aurora", choices=["muon", "aurora"],
                     help="optimizer for 2D matrix params: 'muon' (default) or 'aurora'")
 parser.add_argument("--aurora-pp-iterations", type=int, default=2,
                     help="Aurora outer row-rebalance iterations (1 == plain Muon polar; paper default: 2)")
